@@ -20,8 +20,17 @@
 #include <WebServer.h>
 
 // ============ WIFI CONFIG ============
-const char* WIFI_SSID = "DropitlikeitsHotspot";
-const char* WIFI_PASS = "Nutmeg21";
+// Multiple networks - will try each in order
+struct WiFiNetwork {
+    const char* ssid;
+    const char* pass;
+};
+
+const WiFiNetwork WIFI_NETWORKS[] = {
+    {"Founders3-Office", "Gu1fR3serVe13"},
+    {"DropitlikeitsHotspot", "Nutmeg21"}
+};
+const int NUM_NETWORKS = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 
 WebServer server(80);
 
@@ -49,7 +58,8 @@ const int LED_PIN = LED_BUILTIN;
 
 // ============ RELAY CONFIG ============
 // Set to true if your relay board is active LOW (most are)
-const bool RELAY_ACTIVE_LOW = true;
+// Your board is ACTIVE HIGH - HIGH turns relay ON
+const bool RELAY_ACTIVE_LOW = false;
 
 #define RELAY_ON  (RELAY_ACTIVE_LOW ? LOW : HIGH)
 #define RELAY_OFF (RELAY_ACTIVE_LOW ? HIGH : LOW)
@@ -120,25 +130,33 @@ void updateBrewCycle();
 void stopBrew();
 void abortBrew(const char* reason);
 void setupWiFi();
+void updateWiFi();
 void setupWebServer();
 String getStatusJson();
 String getWebPage();
 
+// WiFi state (defined here for forward reference)
+extern int wifiNetworkIndex;
+extern unsigned long wifiConnectStart;
+extern bool wifiConnecting;
+extern bool wifiSetupDone;
+extern int wifiRetryCount;
+
 // ============ SETUP ============
 void setup() {
-    Serial.begin(115200);
-    delay(2000);
-
-    // Relay pins - all OFF at start
+    // CRITICAL: Set relay pins HIGH (OFF) IMMEDIATELY before anything else
+    // Active LOW relays will turn ON if pins float during boot!
+    digitalWrite(RELAY_PUMP, RELAY_OFF);
+    digitalWrite(RELAY_BOILER, RELAY_OFF);
+    digitalWrite(RELAY_SOLENOID, RELAY_OFF);
+    digitalWrite(RELAY_WARMER, RELAY_OFF);
     pinMode(RELAY_PUMP, OUTPUT);
     pinMode(RELAY_BOILER, OUTPUT);
     pinMode(RELAY_SOLENOID, OUTPUT);
     pinMode(RELAY_WARMER, OUTPUT);
 
-    digitalWrite(RELAY_PUMP, RELAY_OFF);
-    digitalWrite(RELAY_BOILER, RELAY_OFF);
-    digitalWrite(RELAY_SOLENOID, RELAY_OFF);
-    digitalWrite(RELAY_WARMER, RELAY_OFF);
+    Serial.begin(115200);
+    delay(2000);
 
     // Flow sensor with pullup, interrupt on rising edge
     pinMode(FLOW_SENSOR, INPUT_PULLUP);
@@ -161,9 +179,9 @@ void setup() {
     Serial.println(" C");
     Serial.println();
 
-    // Setup WiFi and web server
+    // Setup WiFi (non-blocking - connects in background)
     setupWiFi();
-    setupWebServer();
+    // Web server starts after WiFi connects in updateWiFi()
 
     printHelp();
 }
@@ -177,6 +195,9 @@ void loop() {
     static bool lastButtonState = false;
 
     unsigned long now = millis();
+
+    // Non-blocking WiFi connection
+    updateWiFi();
 
     // Read BOOTSEL button (built into Pico)
     // BOOTSEL is LOW when pressed
@@ -262,8 +283,10 @@ void loop() {
         handleCommand(cmd);
     }
 
-    // Handle web requests
-    server.handleClient();
+    // Handle web requests (only if WiFi connected)
+    if (wifiSetupDone && WiFi.status() == WL_CONNECTED) {
+        server.handleClient();
+    }
 }
 
 // ============ FLOW SENSOR ISR ============
@@ -642,26 +665,71 @@ void printHelp() {
 
 // ============ WIFI & WEB SERVER ============
 
-void setupWiFi() {
-    Serial.print("Connecting to WiFi: ");
-    Serial.println(WIFI_SSID);
+// WiFi state for non-blocking connection
+int wifiNetworkIndex = 0;
+unsigned long wifiConnectStart = 0;
+bool wifiConnecting = false;
+bool wifiSetupDone = false;
+int wifiRetryCount = 0;
 
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
+void startWiFiConnect() {
+    if (wifiNetworkIndex >= NUM_NETWORKS) {
+        wifiNetworkIndex = 0;  // Loop back for retry
+        wifiRetryCount++;
+        if (wifiRetryCount > 2) {
+            Serial.println("WiFi gave up after retries - continuing without");
+            wifiSetupDone = true;
+            return;
+        }
     }
 
+    Serial.print("Trying WiFi: ");
+    Serial.println(WIFI_NETWORKS[wifiNetworkIndex].ssid);
+    WiFi.begin(WIFI_NETWORKS[wifiNetworkIndex].ssid, WIFI_NETWORKS[wifiNetworkIndex].pass);
+    wifiConnectStart = millis();
+    wifiConnecting = true;
+}
+
+void updateWiFi() {
+    if (wifiSetupDone) return;
+
+    if (!wifiConnecting) {
+        // Initial delay before first connect attempt
+        if (millis() > 3000) {
+            startWiFiConnect();
+        }
+        return;
+    }
+
+    // Check connection status (non-blocking)
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println("\nWiFi connected!");
+        Serial.print("Network: ");
+        Serial.println(WIFI_NETWORKS[wifiNetworkIndex].ssid);
         Serial.print("IP: ");
         Serial.println(WiFi.localIP());
-    } else {
-        Serial.println("\nWiFi failed - continuing without network");
+        wifiSetupDone = true;
+        wifiConnecting = false;
+        setupWebServer();
+        return;
     }
+
+    // Timeout after 8 seconds per network
+    if (millis() - wifiConnectStart > 8000) {
+        Serial.println(" timeout");
+        WiFi.disconnect();
+        wifiConnecting = false;
+        wifiNetworkIndex++;
+        // Small delay then try next
+        delay(500);
+        startWiFiConnect();
+    }
+}
+
+void setupWiFi() {
+    // Just initialize - actual connection happens in updateWiFi() non-blocking
+    WiFi.mode(WIFI_STA);
+    Serial.println("WiFi will connect in background...");
 }
 
 String getStatusJson() {
@@ -680,189 +748,53 @@ String getStatusJson() {
     json += "\"warmer\":" + String(warmerOn ? "true" : "false") + ",";
     json += "\"brewTime\":" + String(brewTimeMs / 1000) + ",";
     json += "\"brewElapsed\":" + String(brewElapsed) + ",";
-    json += "\"minTemp\":" + String(MIN_BREW_TEMP, 0);
+    json += "\"minTemp\":" + String(MIN_BREW_TEMP, 0) + ",";
+    json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"rssi\":" + String(WiFi.RSSI());
     json += "}";
     return json;
 }
 
 String getWebPage() {
-    String html = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta charset="UTF-8">
-    <title>Espresso</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 15px; }
-        .header { display: flex; align-items: center; gap: 12px; margin-bottom: 15px; }
-        .logo { width: 50px; height: 50px; }
-        h1 { margin: 0; font-size: 24px; color: #58a6ff; }
-        .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; margin: 12px 0; }
-        .temp-display { text-align: center; }
-        .temp { font-size: 56px; font-weight: bold; color: #f78166; }
-        .temp-info { color: #8b949e; margin-top: 4px; }
-        .state-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
-        .state { font-size: 18px; font-weight: bold; padding: 8px 16px; border-radius: 20px; }
-        .state.IDLE { background: #238636; color: #fff; }
-        .state.PREHEATING { background: #d29922; color: #000; }
-        .state.BREWING { background: #f78166; color: #000; }
-        .state.FINISHING { background: #8957e5; color: #fff; }
-        .timer { font-size: 24px; font-weight: bold; color: #58a6ff; }
-        .relays { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 12px; }
-        .relay-btn { padding: 14px; border-radius: 8px; border: 2px solid #30363d; cursor: pointer; font-size: 14px; font-weight: 600; transition: all 0.2s; text-align: center; }
-        .relay-btn.off { background: #21262d; color: #8b949e; }
-        .relay-btn.on { background: #238636; color: #fff; border-color: #2ea043; }
-        .relay-btn:active { transform: scale(0.95); }
-        .brew-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        .btn { padding: 18px; border: none; border-radius: 10px; font-size: 18px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
-        .btn:active { transform: scale(0.95); }
-        .btn-brew { background: linear-gradient(135deg, #238636, #2ea043); color: #fff; }
-        .btn-stop { background: linear-gradient(135deg, #da3633, #f85149); color: #fff; }
-        .settings { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-        .setting { background: #21262d; border-radius: 8px; padding: 12px; text-align: center; }
-        .setting-label { font-size: 12px; color: #8b949e; margin-bottom: 6px; }
-        .setting-value { font-size: 20px; font-weight: bold; color: #58a6ff; }
-        .setting-btns { display: flex; justify-content: center; gap: 8px; margin-top: 8px; }
-        .adj-btn { width: 36px; height: 36px; border-radius: 50%; border: none; font-size: 18px; font-weight: bold; cursor: pointer; }
-        .adj-btn.minus { background: #f85149; color: #fff; }
-        .adj-btn.plus { background: #238636; color: #fff; }
-        .flow-info { display: flex; justify-content: space-around; text-align: center; }
-        .flow-item { flex: 1; }
-        .flow-value { font-size: 24px; font-weight: bold; color: #79c0ff; }
-        .flow-label { font-size: 12px; color: #8b949e; }
-        .reset-btn { background: #30363d; color: #8b949e; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; margin-top: 10px; font-size: 12px; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <svg class="logo" viewBox="0 0 100 100">
-            <defs>
-                <linearGradient id="steam" x1="0%" y1="100%" x2="0%" y2="0%">
-                    <stop offset="0%" style="stop-color:#8b949e;stop-opacity:0.8"/>
-                    <stop offset="100%" style="stop-color:#8b949e;stop-opacity:0"/>
-                </linearGradient>
-                <linearGradient id="cup" x1="0%" y1="0%" x2="0%" y2="100%">
-                    <stop offset="0%" style="stop-color:#f78166"/>
-                    <stop offset="100%" style="stop-color:#da3633"/>
-                </linearGradient>
-            </defs>
-            <!-- Steam -->
-            <path d="M35 35 Q32 25, 38 15" stroke="url(#steam)" stroke-width="3" fill="none" stroke-linecap="round"/>
-            <path d="M50 30 Q47 20, 53 10" stroke="url(#steam)" stroke-width="3" fill="none" stroke-linecap="round"/>
-            <path d="M65 35 Q62 25, 68 15" stroke="url(#steam)" stroke-width="3" fill="none" stroke-linecap="round"/>
-            <!-- Cup body -->
-            <path d="M20 45 L25 85 Q27 92, 35 92 L65 92 Q73 92, 75 85 L80 45 Z" fill="url(#cup)"/>
-            <!-- Handle -->
-            <path d="M80 50 Q95 50, 95 65 Q95 80, 80 80" stroke="#f78166" stroke-width="6" fill="none" stroke-linecap="round"/>
-            <!-- Coffee surface -->
-            <ellipse cx="50" cy="48" rx="28" ry="6" fill="#3d2817"/>
-            <!-- Shine -->
-            <path d="M30 55 Q35 52, 45 55" stroke="rgba(255,255,255,0.3)" stroke-width="2" fill="none" stroke-linecap="round"/>
-        </svg>
-        <h1>Espresso Controller</h1>
-    </div>
-
-    <div class="card temp-display">
-        <div class="temp" id="temp">--</div>
-        <div class="temp-info">Current / Target: <span id="target">--</span>C (min <span id="minTemp">--</span>C)</div>
-    </div>
-
-    <div class="card">
-        <div class="state-bar">
-            <span class="state IDLE" id="state">IDLE</span>
-            <span class="timer" id="timer">--</span>
-        </div>
-        <div class="relays">
-            <button class="relay-btn off" id="pump" onclick="toggle('pump')">Pump</button>
-            <button class="relay-btn off" id="boiler" onclick="toggle('boiler')">Boiler</button>
-            <button class="relay-btn off" id="solenoid" onclick="toggle('solenoid')">Solenoid</button>
-            <button class="relay-btn off" id="warmer" onclick="toggle('warmer')">Warmer</button>
-        </div>
-    </div>
-
-    <div class="card brew-btns">
-        <button class="btn btn-brew" onclick="brew()">BREW</button>
-        <button class="btn btn-stop" onclick="stop()">STOP</button>
-    </div>
-
-    <div class="card settings">
-        <div class="setting">
-            <div class="setting-label">Target Temp (C)</div>
-            <div class="setting-value" id="targetVal">93</div>
-            <div class="setting-btns">
-                <button class="adj-btn minus" onclick="adj('temp',-1)">-</button>
-                <button class="adj-btn plus" onclick="adj('temp',1)">+</button>
-            </div>
-        </div>
-        <div class="setting">
-            <div class="setting-label">Brew Time (sec)</div>
-            <div class="setting-value" id="brewTimeVal">25</div>
-            <div class="setting-btns">
-                <button class="adj-btn minus" onclick="adj('time',-5)">-</button>
-                <button class="adj-btn plus" onclick="adj('time',5)">+</button>
-            </div>
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="flow-info">
-            <div class="flow-item">
-                <div class="flow-value" id="flow">0</div>
-                <div class="flow-label">mL/sec</div>
-            </div>
-            <div class="flow-item">
-                <div class="flow-value" id="volume">0</div>
-                <div class="flow-label">mL total</div>
-            </div>
-        </div>
-        <center><button class="reset-btn" onclick="fetch('/reset')">Reset Flow Counter</button></center>
-    </div>
-
-    <script>
-        function update() {
-            fetch('/status').then(r=>r.json()).then(d => {
-                document.getElementById('temp').textContent = d.temp + 'C';
-                document.getElementById('target').textContent = d.target;
-                document.getElementById('targetVal').textContent = d.target;
-                document.getElementById('minTemp').textContent = d.minTemp;
-                document.getElementById('flow').textContent = d.flow;
-                document.getElementById('volume').textContent = d.volume;
-                document.getElementById('brewTimeVal').textContent = d.brewTime;
-
-                // State badge
-                let stateEl = document.getElementById('state');
-                stateEl.textContent = d.state;
-                stateEl.className = 'state ' + d.state;
-
-                // Timer
-                let timer = document.getElementById('timer');
-                if (d.state === 'BREWING') {
-                    timer.textContent = d.brewElapsed + '/' + d.brewTime + 's';
-                } else if (d.state === 'PREHEATING') {
-                    timer.textContent = 'Heating...';
-                } else {
-                    timer.textContent = '';
-                }
-
-                // Relay buttons
-                ['pump','boiler','solenoid','warmer'].forEach(r => {
-                    let el = document.getElementById(r);
-                    el.className = 'relay-btn ' + (d[r] ? 'on' : 'off');
-                });
-            }).catch(e => {});
-        }
-        function toggle(r) { fetch('/toggle?r=' + r); }
-        function brew() { fetch('/brew'); }
-        function stop() { fetch('/stop'); }
-        function adj(what, delta) { fetch('/adj?what=' + what + '&delta=' + delta); }
-        setInterval(update, 500);
-        update();
-    </script>
-</body>
-</html>
-)rawliteral";
+    String html = R"rawliteral(<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="UTF-8"><title>Espresso</title><style>
+*{box-sizing:border-box}body{font-family:Arial;background:#0d1117;color:#c9d1d9;margin:0;padding:10px}
+.h{display:flex;align-items:center;gap:10px;margin-bottom:10px}.logo{width:40px;height:40px}h1{margin:0;font-size:20px;color:#58a6ff}
+.c{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px;margin:8px 0}
+.t{font-size:48px;font-weight:bold;color:#f78166;text-align:center}.ti{color:#8b949e;text-align:center}
+.sb{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.st{font-size:16px;font-weight:bold;padding:6px 12px;border-radius:16px}
+.st.IDLE{background:#238636;color:#fff}.st.PREHEATING{background:#d29922;color:#000}
+.st.BREWING{background:#f78166;color:#000}.st.FINISHING{background:#8957e5;color:#fff}
+.tm{font-size:20px;font-weight:bold;color:#58a6ff}
+.rl{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.rb{padding:12px;border-radius:6px;border:2px solid #30363d;cursor:pointer;font-size:13px;font-weight:600;text-align:center}
+.rb.off{background:#21262d;color:#8b949e}.rb.on{background:#238636;color:#fff;border-color:#2ea043}
+.bb{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.bn{padding:14px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer}
+.bg{background:#238636;color:#fff}.br{background:#da3633;color:#fff}
+.ss{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.se{background:#21262d;border-radius:6px;padding:10px;text-align:center}
+.sl{font-size:11px;color:#8b949e}.sv{font-size:18px;font-weight:bold;color:#58a6ff}
+.ab{width:32px;height:32px;border-radius:50%;border:none;font-size:16px;font-weight:bold;cursor:pointer;margin:4px}
+.am{background:#f85149;color:#fff}.ap{background:#238636;color:#fff}
+.fi{display:flex;justify-content:space-around;text-align:center}
+.fv{font-size:20px;font-weight:bold;color:#79c0ff}.fl{font-size:11px;color:#8b949e}
+.rt{background:#30363d;color:#8b949e;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;margin-top:8px;font-size:11px}
+</style></head><body>
+<div class="h"><svg class="logo" viewBox="0 0 100 100"><defs><linearGradient id="s" x1="0%" y1="100%" x2="0%" y2="0%"><stop offset="0%" stop-color="#8b949e" stop-opacity="0.8"/><stop offset="100%" stop-color="#8b949e" stop-opacity="0"/></linearGradient><linearGradient id="u" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#f78166"/><stop offset="100%" stop-color="#da3633"/></linearGradient></defs><path d="M35 35Q32 25 38 15" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M50 30Q47 20 53 10" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M65 35Q62 25 68 15" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M20 45L25 85Q27 92 35 92L65 92Q73 92 75 85L80 45Z" fill="url(#u)"/><path d="M80 50Q95 50 95 65Q95 80 80 80" stroke="#f78166" stroke-width="6" fill="none"/><ellipse cx="50" cy="48" rx="28" ry="6" fill="#3d2817"/></svg><h1>Espresso</h1></div>
+<div class="c"><div class="t" id="temp">--</div><div class="ti">Target: <span id="target">--</span>C</div></div>
+<div class="c"><div class="sb"><span class="st IDLE" id="state">IDLE</span><span class="tm" id="timer"></span></div>
+<div class="rl"><button class="rb off" id="pump" onclick="T('pump')">Pump</button><button class="rb off" id="boiler" onclick="T('boiler')">Boiler</button><button class="rb off" id="solenoid" onclick="T('solenoid')">Solenoid</button><button class="rb off" id="warmer" onclick="T('warmer')">Warmer</button></div></div>
+<div class="c bb"><button class="bn bg" onclick="B()">BREW</button><button class="bn br" onclick="S()">STOP</button></div>
+<div class="c ss"><div class="se"><div class="sl">Temp (C)</div><div class="sv" id="tv">93</div><button class="ab am" onclick="A('temp',-1)">-</button><button class="ab ap" onclick="A('temp',1)">+</button></div>
+<div class="se"><div class="sl">Time (s)</div><div class="sv" id="bv">25</div><button class="ab am" onclick="A('time',-5)">-</button><button class="ab ap" onclick="A('time',5)">+</button></div></div>
+<div class="c"><div class="fi"><div><div class="fv" id="flow">0</div><div class="fl">mL/s</div></div><div><div class="fv" id="vol">0</div><div class="fl">mL</div></div></div><center><button class="rt" onclick="fetch('/reset')">Reset</button></center></div>
+<div class="c" style="font-size:11px;color:#8b949e"><span id="wifi">WiFi: --</span> | <span id="rssi">--</span>dBm | <span id="ip">--</span> <button class="rt" onclick="fetch('/wifi').then(()=>location.reload())" style="margin-left:8px">Reconnect</button></div>
+<script>
+function U(){fetch('/status').then(r=>r.json()).then(d=>{document.getElementById('temp').textContent=d.temp+'C';document.getElementById('target').textContent=d.target;document.getElementById('tv').textContent=d.target;document.getElementById('flow').textContent=d.flow;document.getElementById('vol').textContent=d.volume;document.getElementById('bv').textContent=d.brewTime;var s=document.getElementById('state');s.textContent=d.state;s.className='st '+d.state;var t=document.getElementById('timer');t.textContent=d.state==='BREWING'?d.brewElapsed+'/'+d.brewTime+'s':d.state==='PREHEATING'?'Heating...':'';['pump','boiler','solenoid','warmer'].forEach(r=>{document.getElementById(r).className='rb '+(d[r]?'on':'off')});document.getElementById('wifi').textContent='WiFi: '+(d.wifiConnected?'OK':'--');document.getElementById('rssi').textContent=d.rssi;document.getElementById('ip').textContent=d.ip}).catch(e=>{})}
+var L=0;function T(r){if(L)return;L=1;fetch('/toggle?r='+r).then(x=>x.json()).then(d=>{L=0;['pump','boiler','solenoid','warmer'].forEach(r=>{document.getElementById(r).className='rb '+(d[r]?'on':'off')})}).catch(e=>{L=0})}function B(){fetch('/brew')}function S(){fetch('/stop')}function A(w,d){fetch('/adj?what='+w+'&delta='+d)}setInterval(U,1000);U()
+</script></body></html>)rawliteral";
     return html;
 }
 
@@ -895,7 +827,7 @@ void setupWebServer() {
         server.send(200, "text/plain", "Stopped");
     });
 
-    // Toggle individual relays
+    // Toggle individual relays - returns JSON with current state
     server.on("/toggle", []() {
         String relay = server.arg("r");
         if (relay == "pump") {
@@ -911,7 +843,8 @@ void setupWebServer() {
             warmerOn = !warmerOn;
             setRelay(RELAY_WARMER, warmerOn, "Warmer");
         }
-        server.send(200, "text/plain", "OK");
+        // Return full status so UI stays in sync
+        server.send(200, "application/json", getStatusJson());
     });
 
     // Adjust settings (temp or brew time)
@@ -943,6 +876,17 @@ void setupWebServer() {
         flowPulseCount = 0;
         Serial.println("Flow counter reset");
         server.send(200, "text/plain", "OK");
+    });
+
+    // WiFi reconnect
+    server.on("/wifi", []() {
+        Serial.println("WiFi reconnect requested");
+        wifiSetupDone = false;
+        wifiConnecting = false;
+        wifiNetworkIndex = 0;
+        wifiRetryCount = 0;
+        WiFi.disconnect();
+        server.send(200, "text/plain", "Reconnecting...");
     });
 
     server.begin();
