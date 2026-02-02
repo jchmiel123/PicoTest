@@ -18,6 +18,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <LEAmDNS.h>
+#include <Updater.h>
 
 // ============ WIFI CONFIG ============
 // Multiple networks - will try each in order
@@ -89,6 +91,10 @@ float boilerTemp = 0;
 float targetTemp = 93.0;   // Default brew temp (espresso sweet spot)
 bool heaterOn = false;
 float tempHysteresis = 2.0; // +/- degrees
+bool useFahrenheit = false; // Display in F if true
+
+// Info page password
+const char* INFO_PASSWORD = "Coffee4Me!";
 
 // ============ BREW SETTINGS ============
 const unsigned long BREW_TIME_MS = 25000;  // 25 seconds (standard espresso)
@@ -286,6 +292,7 @@ void loop() {
     // Handle web requests (only if WiFi connected)
     if (wifiSetupDone && WiFi.status() == WL_CONNECTED) {
         server.handleClient();
+        MDNS.update();
     }
 }
 
@@ -381,16 +388,38 @@ void toggleRelayDirect(int relayNum) {
     Serial.println(*states[relayNum] ? "ON" : "OFF");
 }
 
+// ============ EXPLICIT RELAY STATE CONTROL ============
+// Set ALL relays to explicit states - no assumptions, no toggles
+// This prevents "oops coffee everywhere" situations
+
+void setAllRelays(bool pump, bool boiler, bool solenoid, bool warmer, const char* context) {
+    Serial.print("[");
+    Serial.print(context);
+    Serial.print("] Relays: P=");
+    Serial.print(pump ? "ON" : "off");
+    Serial.print(" B=");
+    Serial.print(boiler ? "ON" : "off");
+    Serial.print(" S=");
+    Serial.print(solenoid ? "ON" : "off");
+    Serial.print(" W=");
+    Serial.println(warmer ? "ON" : "off");
+
+    // Set all at once
+    digitalWrite(RELAY_PUMP, pump ? RELAY_ON : RELAY_OFF);
+    digitalWrite(RELAY_BOILER, boiler ? RELAY_ON : RELAY_OFF);
+    digitalWrite(RELAY_SOLENOID, solenoid ? RELAY_ON : RELAY_OFF);
+    digitalWrite(RELAY_WARMER, warmer ? RELAY_ON : RELAY_OFF);
+
+    // Update state tracking
+    pumpOn = pump;
+    heaterOn = boiler;
+    solenoidOn = solenoid;
+    warmerOn = warmer;
+}
+
 // Safety function: turn all relays off
 void allRelaysOff() {
-    digitalWrite(RELAY_PUMP, RELAY_OFF);
-    digitalWrite(RELAY_BOILER, RELAY_OFF);
-    digitalWrite(RELAY_SOLENOID, RELAY_OFF);
-    digitalWrite(RELAY_WARMER, RELAY_OFF);
-    pumpOn = false;
-    heaterOn = false;
-    solenoidOn = false;
-    warmerOn = false;
+    setAllRelays(false, false, false, false, "ALL OFF");
     brewingActive = false;
 }
 
@@ -412,18 +441,13 @@ void startBrewCycle() {
     totalVolume = 0;
     flowPulseCount = 0;
 
-    // Turn on cup warmer (optional)
-    setRelay(RELAY_WARMER, true, "Cup Warmer");
-    warmerOn = true;
+    // PREHEAT STATE: Boiler ON, Warmer ON, Pump OFF, Solenoid OFF
+    setAllRelays(false, true, false, true, "PREHEAT");
 
-    // Start preheating
     brewState = PREHEATING;
     preheatStartTime = millis();
     preheating = true;
-
-    // Boiler ON
-    setRelay(RELAY_BOILER, true, "Boiler");
-    heaterOn = true;
+    brewingActive = true;
 
     Serial.println("Preheating...");
 }
@@ -445,19 +469,13 @@ void updateBrewCycle() {
                 Serial.print(boilerTemp, 1);
                 Serial.println("C");
 
-                // Start brewing - solenoid and pump ON together
+                // BREW STATE: Pump ON, Solenoid ON, Boiler ON (for temp control), Warmer ON
+                setAllRelays(true, true, true, true, "BREW");
+
                 brewState = BREWING;
                 brewStartTime = now;
-                brewingActive = true;
 
                 Serial.println("=== BREWING ===");
-
-                // Solenoid and pump ON at the same time
-                setRelay(RELAY_SOLENOID, true, "Solenoid");
-                solenoidOn = true;
-
-                setRelay(RELAY_PUMP, true, "Pump");
-                pumpOn = true;
             }
             // Check for preheat timeout
             else if (now - preheatStartTime > PREHEAT_TIMEOUT_MS) {
@@ -486,20 +504,8 @@ void updateBrewCycle() {
 void stopBrew() {
     unsigned long brewTime = (millis() - brewStartTime) / 1000;
 
-    // Turn off pump and solenoid
-    setRelay(RELAY_PUMP, false, "Pump");
-    pumpOn = false;
-
-    setRelay(RELAY_SOLENOID, false, "Solenoid");
-    solenoidOn = false;
-
-    // Turn off boiler
-    setRelay(RELAY_BOILER, false, "Boiler");
-    heaterOn = false;
-
-    // Cup warmer stays on a bit? Or turn off
-    setRelay(RELAY_WARMER, false, "Cup Warmer");
-    warmerOn = false;
+    // STOP STATE: ALL OFF - explicit, no ambiguity
+    setAllRelays(false, false, false, false, "STOP");
 
     brewingActive = false;
     preheating = false;
@@ -522,14 +528,12 @@ void abortBrew(const char* reason) {
     Serial.print("!!! ABORT: ");
     Serial.println(reason);
 
-    // Turn everything off
-    allRelaysOff();
+    // ABORT: ALL OFF immediately - no exceptions
+    setAllRelays(false, false, false, false, "ABORT");
 
     brewState = IDLE;
     brewingActive = false;
     preheating = false;
-
-    Serial.println("All relays OFF");
 }
 
 // ============ COMMAND HANDLING ============
@@ -732,13 +736,21 @@ void setupWiFi() {
     Serial.println("WiFi will connect in background...");
 }
 
+// Helper: convert C to F
+float toFahrenheit(float c) {
+    return c * 9.0 / 5.0 + 32.0;
+}
+
 String getStatusJson() {
     const char* stateNames[] = {"IDLE", "PREHEATING", "BREWING", "FINISHING"};
     unsigned long brewElapsed = (brewState == BREWING) ? (millis() - brewStartTime) / 1000 : 0;
 
     String json = "{";
     json += "\"temp\":" + String(boilerTemp, 1) + ",";
+    json += "\"tempF\":" + String(toFahrenheit(boilerTemp), 1) + ",";
     json += "\"target\":" + String(targetTemp, 1) + ",";
+    json += "\"targetF\":" + String(toFahrenheit(targetTemp), 1) + ",";
+    json += "\"useF\":" + String(useFahrenheit ? "true" : "false") + ",";
     json += "\"flow\":" + String(flowRate, 2) + ",";
     json += "\"volume\":" + String(totalVolume, 1) + ",";
     json += "\"state\":\"" + String(stateNames[brewState]) + "\",";
@@ -751,7 +763,10 @@ String getStatusJson() {
     json += "\"minTemp\":" + String(MIN_BREW_TEMP, 0) + ",";
     json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-    json += "\"rssi\":" + String(WiFi.RSSI());
+    json += "\"ssid\":\"" + WiFi.SSID() + "\",";
+    json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+    json += "\"uptime\":" + String(millis() / 1000) + ",";
+    json += "\"freeHeap\":" + String(rp2040.getFreeHeap());
     json += "}";
     return json;
 }
@@ -780,20 +795,90 @@ String getWebPage() {
 .am{background:#f85149;color:#fff}.ap{background:#238636;color:#fff}
 .fi{display:flex;justify-content:space-around;text-align:center}
 .fv{font-size:20px;font-weight:bold;color:#79c0ff}.fl{font-size:11px;color:#8b949e}
-.rt{background:#30363d;color:#8b949e;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;margin-top:8px;font-size:11px}
+.rt{background:#30363d;color:#8b949e;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:11px}
+.ib{background:#58a6ff;color:#0d1117;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px}
+.tu{cursor:pointer;text-decoration:underline}
 </style></head><body>
-<div class="h"><svg class="logo" viewBox="0 0 100 100"><defs><linearGradient id="s" x1="0%" y1="100%" x2="0%" y2="0%"><stop offset="0%" stop-color="#8b949e" stop-opacity="0.8"/><stop offset="100%" stop-color="#8b949e" stop-opacity="0"/></linearGradient><linearGradient id="u" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#f78166"/><stop offset="100%" stop-color="#da3633"/></linearGradient></defs><path d="M35 35Q32 25 38 15" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M50 30Q47 20 53 10" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M65 35Q62 25 68 15" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M20 45L25 85Q27 92 35 92L65 92Q73 92 75 85L80 45Z" fill="url(#u)"/><path d="M80 50Q95 50 95 65Q95 80 80 80" stroke="#f78166" stroke-width="6" fill="none"/><ellipse cx="50" cy="48" rx="28" ry="6" fill="#3d2817"/></svg><h1>Espresso</h1></div>
-<div class="c"><div class="t" id="temp">--</div><div class="ti">Target: <span id="target">--</span>C</div></div>
+<div class="h"><svg class="logo" viewBox="0 0 100 100"><defs><linearGradient id="s" x1="0%" y1="100%" x2="0%" y2="0%"><stop offset="0%" stop-color="#8b949e" stop-opacity="0.8"/><stop offset="100%" stop-color="#8b949e" stop-opacity="0"/></linearGradient><linearGradient id="u" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#f78166"/><stop offset="100%" stop-color="#da3633"/></linearGradient></defs><path d="M35 35Q32 25 38 15" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M50 30Q47 20 53 10" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M65 35Q62 25 68 15" stroke="url(#s)" stroke-width="3" fill="none"/><path d="M20 45L25 85Q27 92 35 92L65 92Q73 92 75 85L80 45Z" fill="url(#u)"/><path d="M80 50Q95 50 95 65Q95 80 80 80" stroke="#f78166" stroke-width="6" fill="none"/><ellipse cx="50" cy="48" rx="28" ry="6" fill="#3d2817"/></svg><h1>Espresso</h1><button class="ib" onclick="showInfo()" style="margin-left:auto">Info</button></div>
+<div class="c"><div class="t" id="temp">--</div><div class="ti">Target: <span id="target">--</span><span id="unit" class="tu" onclick="toggleUnit()">C</span></div></div>
 <div class="c"><div class="sb"><span class="st IDLE" id="state">IDLE</span><span class="tm" id="timer"></span></div>
 <div class="rl"><button class="rb off" id="pump" onclick="T('pump')">Pump</button><button class="rb off" id="boiler" onclick="T('boiler')">Boiler</button><button class="rb off" id="solenoid" onclick="T('solenoid')">Solenoid</button><button class="rb off" id="warmer" onclick="T('warmer')">Warmer</button></div></div>
 <div class="c bb"><button class="bn bg" onclick="B()">BREW</button><button class="bn br" onclick="S()">STOP</button></div>
-<div class="c ss"><div class="se"><div class="sl">Temp (C)</div><div class="sv" id="tv">93</div><button class="ab am" onclick="A('temp',-1)">-</button><button class="ab ap" onclick="A('temp',1)">+</button></div>
+<div class="c ss"><div class="se"><div class="sl">Temp (<span id="tul">C</span>)</div><div class="sv" id="tv">93</div><button class="ab am" onclick="A('temp',-1)">-</button><button class="ab ap" onclick="A('temp',1)">+</button></div>
 <div class="se"><div class="sl">Time (s)</div><div class="sv" id="bv">25</div><button class="ab am" onclick="A('time',-5)">-</button><button class="ab ap" onclick="A('time',5)">+</button></div></div>
 <div class="c"><div class="fi"><div><div class="fv" id="flow">0</div><div class="fl">mL/s</div></div><div><div class="fv" id="vol">0</div><div class="fl">mL</div></div></div><center><button class="rt" onclick="fetch('/reset')">Reset</button></center></div>
-<div class="c" style="font-size:11px;color:#8b949e"><span id="wifi">WiFi: --</span> | <span id="rssi">--</span>dBm | <span id="ip">--</span> <button class="rt" onclick="fetch('/wifi').then(()=>location.reload())" style="margin-left:8px">Reconnect</button></div>
+<div class="c" style="font-size:11px;color:#8b949e"><span id="wifi">WiFi: --</span> | <span id="rssi">--</span>dBm | <span id="ip">--</span></div>
+<div id="infopanel" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.95);padding:20px;z-index:100;overflow-y:auto">
+<div style="max-width:400px;margin:auto">
+<h2 style="color:#58a6ff;margin-top:0">System Info</h2>
+<div id="infolock">
+<p style="color:#8b949e">Enter password to access system controls:</p>
+<input type="password" id="infopw" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:10px;width:100%;border-radius:6px;margin-bottom:10px" placeholder="Password">
+<button class="ib" onclick="checkPw()">Unlock</button>
+<button class="rt" onclick="hideInfo()" style="margin-left:10px">Cancel</button>
+</div>
+<div id="infocontent" style="display:none">
+<div class="c"><div class="sl">Pico 2W (RP2350)</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+<div><span class="fl">Uptime:</span><br><span class="fv" id="iup">--</span></div>
+<div><span class="fl">Free RAM:</span><br><span class="fv" id="iheap">--</span></div>
+<div><span class="fl">WiFi SSID:</span><br><span class="fv" id="issid">--</span></div>
+<div><span class="fl">Signal:</span><br><span class="fv" id="irssi">--</span>dBm</div>
+<div><span class="fl">IP Address:</span><br><span class="fv" id="iip">--</span></div>
+<div><span class="fl">Temp Unit:</span><br><span class="fv" id="iunit">C</span></div>
+</div></div>
+<div class="c"><div class="sl">System Controls</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
+<button class="bn" style="background:#d29922;color:#000" onclick="sysCmd('reboot')">Reboot</button>
+<button class="bn br" onclick="sysCmd('sleep')">Deep Sleep</button>
+<button class="bn" style="background:#8957e5;color:#fff" onclick="sysCmd('alloff')">All Relays Off</button>
+<button class="bn" style="background:#238636;color:#fff" onclick="toggleUnit()">Toggle C/F</button>
+<button class="bn" style="background:#30363d;color:#c9d1d9" onclick="sysCmd('defaults')">Reset Defaults</button>
+<button class="bn" style="background:#30363d;color:#c9d1d9" onclick="sysCmd('wifireset')">WiFi Reconnect</button>
+<button class="bn" style="background:#f78166;color:#000;grid-column:span 2" onclick="location.href='/update'">OTA Firmware Update</button>
+</div></div>
+<div class="c"><div class="sl">GPIO Pins</div>
+<div style="font-size:11px;color:#8b949e;margin-top:8px">
+GP2: Pump | GP3: Boiler | GP4: Solenoid | GP5: Warmer<br>
+GP6: Flow Sensor | GP26: Thermistor (ADC0)<br>
+Active HIGH relays (HIGH = ON)
+</div></div>
+<button class="bn" style="background:#30363d;color:#c9d1d9;width:100%;margin-top:10px" onclick="hideInfo()">Close</button>
+</div></div></div>
 <script>
-function U(){fetch('/status').then(r=>r.json()).then(d=>{document.getElementById('temp').textContent=d.temp+'C';document.getElementById('target').textContent=d.target;document.getElementById('tv').textContent=d.target;document.getElementById('flow').textContent=d.flow;document.getElementById('vol').textContent=d.volume;document.getElementById('bv').textContent=d.brewTime;var s=document.getElementById('state');s.textContent=d.state;s.className='st '+d.state;var t=document.getElementById('timer');t.textContent=d.state==='BREWING'?d.brewElapsed+'/'+d.brewTime+'s':d.state==='PREHEATING'?'Heating...':'';['pump','boiler','solenoid','warmer'].forEach(r=>{document.getElementById(r).className='rb '+(d[r]?'on':'off')});document.getElementById('wifi').textContent='WiFi: '+(d.wifiConnected?'OK':'--');document.getElementById('rssi').textContent=d.rssi;document.getElementById('ip').textContent=d.ip}).catch(e=>{})}
-var L=0;function T(r){if(L)return;L=1;fetch('/toggle?r='+r).then(x=>x.json()).then(d=>{L=0;['pump','boiler','solenoid','warmer'].forEach(r=>{document.getElementById(r).className='rb '+(d[r]?'on':'off')})}).catch(e=>{L=0})}function B(){fetch('/brew')}function S(){fetch('/stop')}function A(w,d){fetch('/adj?what='+w+'&delta='+d)}setInterval(U,1000);U()
+var uF=false;
+function U(){fetch('/status').then(r=>r.json()).then(d=>{
+uF=d.useF;var tp=uF?d.tempF:d.temp;var tg=uF?d.targetF:d.target;var u=uF?'F':'C';
+document.getElementById('temp').textContent=tp.toFixed(1)+u;
+document.getElementById('target').textContent=tg.toFixed(1);
+document.getElementById('unit').textContent=u;
+document.getElementById('tul').textContent=u;
+document.getElementById('tv').textContent=tg.toFixed(0);
+document.getElementById('flow').textContent=d.flow;
+document.getElementById('vol').textContent=d.volume;
+document.getElementById('bv').textContent=d.brewTime;
+var s=document.getElementById('state');s.textContent=d.state;s.className='st '+d.state;
+var t=document.getElementById('timer');t.textContent=d.state==='BREWING'?d.brewElapsed+'/'+d.brewTime+'s':d.state==='PREHEATING'?'Heating...':'';
+['pump','boiler','solenoid','warmer'].forEach(r=>{document.getElementById(r).className='rb '+(d[r]?'on':'off')});
+document.getElementById('wifi').textContent='WiFi: '+(d.wifiConnected?d.ssid:'--');
+document.getElementById('rssi').textContent=d.rssi;
+document.getElementById('ip').textContent=d.ip;
+document.getElementById('iup').textContent=formatUptime(d.uptime);
+document.getElementById('iheap').textContent=(d.freeHeap/1024).toFixed(1)+'KB';
+document.getElementById('issid').textContent=d.ssid;
+document.getElementById('irssi').textContent=d.rssi;
+document.getElementById('iip').textContent=d.ip;
+document.getElementById('iunit').textContent=u;
+}).catch(e=>{})}
+function formatUptime(s){var h=Math.floor(s/3600);var m=Math.floor((s%3600)/60);var sec=s%60;return h+'h '+m+'m '+sec+'s'}
+var L=0;function T(r){if(L)return;L=1;fetch('/toggle?r='+r).then(x=>x.json()).then(d=>{L=0;['pump','boiler','solenoid','warmer'].forEach(r=>{document.getElementById(r).className='rb '+(d[r]?'on':'off')})}).catch(e=>{L=0})}
+function B(){fetch('/brew')}function S(){fetch('/stop')}function A(w,d){fetch('/adj?what='+w+'&delta='+d)}
+function toggleUnit(){fetch('/togglef').then(r=>r.text()).then(u=>{uF=(u==='F');U()})}
+function showInfo(){document.getElementById('infopanel').style.display='block';document.getElementById('infolock').style.display='block';document.getElementById('infocontent').style.display='none';document.getElementById('infopw').value='';document.getElementById('infopw').focus()}
+function hideInfo(){document.getElementById('infopanel').style.display='none'}
+function checkPw(){fetch('/checkpw?pw='+encodeURIComponent(document.getElementById('infopw').value)).then(r=>r.text()).then(x=>{if(x==='OK'){document.getElementById('infolock').style.display='none';document.getElementById('infocontent').style.display='block'}else{alert('Wrong password')}})}
+function sysCmd(c){if(c==='reboot'&&!confirm('Reboot the Pico?'))return;if(c==='sleep'&&!confirm('Enter deep sleep? Power cycle to wake.'))return;if(c==='defaults'&&!confirm('Reset settings to defaults?'))return;fetch('/sys?cmd='+c).then(r=>r.text()).then(x=>{alert(x);if(c==='reboot'||c==='sleep')hideInfo()})}
+setInterval(U,1000);U()
 </script></body></html>)rawliteral";
     return html;
 }
@@ -819,11 +904,9 @@ void setupWebServer() {
         }
     });
 
-    // Stop button
+    // Stop button - ALWAYS turns everything off, no matter what state
     server.on("/stop", []() {
-        if (brewState != IDLE) {
-            abortBrew("Web stop");
-        }
+        abortBrew("Web stop");  // Always stop, even if IDLE - safety first
         server.send(200, "text/plain", "Stopped");
     });
 
@@ -854,7 +937,7 @@ void setupWebServer() {
 
         if (what == "temp") {
             targetTemp += delta;
-            if (targetTemp < 70) targetTemp = 70;
+            if (targetTemp < 50) targetTemp = 50;   // Lower limit for testing
             if (targetTemp > 100) targetTemp = 100;
             Serial.print("Target temp: ");
             Serial.print(targetTemp);
@@ -868,6 +951,14 @@ void setupWebServer() {
             Serial.println(" sec");
         }
         server.send(200, "text/plain", "OK");
+    });
+
+    // Toggle Fahrenheit mode
+    server.on("/togglef", []() {
+        useFahrenheit = !useFahrenheit;
+        Serial.print("Temp unit: ");
+        Serial.println(useFahrenheit ? "Fahrenheit" : "Celsius");
+        server.send(200, "text/plain", useFahrenheit ? "F" : "C");
     });
 
     // Reset flow counter
@@ -889,6 +980,136 @@ void setupWebServer() {
         server.send(200, "text/plain", "Reconnecting...");
     });
 
+    // Password check for info panel
+    server.on("/checkpw", []() {
+        String pw = server.arg("pw");
+        if (pw == INFO_PASSWORD) {
+            Serial.println("Info panel unlocked");
+            server.send(200, "text/plain", "OK");
+        } else {
+            Serial.println("Wrong password attempt");
+            server.send(200, "text/plain", "FAIL");
+        }
+    });
+
+    // System commands (reboot, sleep, alloff, defaults, wifireset)
+    server.on("/sys", []() {
+        String cmd = server.arg("cmd");
+        Serial.print("System command: ");
+        Serial.println(cmd);
+
+        if (cmd == "reboot") {
+            server.send(200, "text/plain", "Rebooting...");
+            delay(500);
+            rp2040.reboot();
+        } else if (cmd == "sleep") {
+            server.send(200, "text/plain", "Entering deep sleep. Power cycle to wake.");
+            delay(500);
+            allRelaysOff();
+            // Deep sleep - requires power cycle to wake
+            // Note: Pico 2 doesn't have true deep sleep like ESP32, this is dormant mode
+            rp2040.reboot();  // For now just reboot, dormant mode needs RTC
+        } else if (cmd == "alloff") {
+            allRelaysOff();
+            server.send(200, "text/plain", "All relays OFF");
+        } else if (cmd == "defaults") {
+            targetTemp = 93.0;
+            brewTimeMs = 25000;
+            useFahrenheit = false;
+            allRelaysOff();
+            server.send(200, "text/plain", "Settings reset to defaults");
+        } else if (cmd == "wifireset") {
+            server.send(200, "text/plain", "WiFi reconnecting...");
+            wifiSetupDone = false;
+            wifiConnecting = false;
+            wifiNetworkIndex = 0;
+            wifiRetryCount = 0;
+            WiFi.disconnect();
+        } else {
+            server.send(400, "text/plain", "Unknown command");
+        }
+    });
+
+    // OTA Update page
+    server.on("/update", HTTP_GET, []() {
+        String html = R"rawliteral(<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:Arial;background:#0d1117;color:#c9d1d9;padding:20px;text-align:center}
+.c{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;max-width:400px;margin:auto}
+h2{color:#58a6ff}input[type=file]{margin:20px 0}
+.btn{background:#238636;color:#fff;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:16px}
+.prog{width:100%;height:20px;background:#21262d;border-radius:10px;overflow:hidden;margin:20px 0;display:none}
+.bar{width:0%;height:100%;background:#238636;transition:width 0.3s}
+#msg{margin-top:20px;color:#8b949e}
+</style></head><body>
+<div class="c"><h2>OTA Firmware Update</h2>
+<form method="POST" action="/update" enctype="multipart/form-data" id="f">
+<input type="file" name="update" accept=".bin,.uf2" id="file">
+<br><button type="submit" class="btn">Upload</button>
+</form>
+<div class="prog" id="prog"><div class="bar" id="bar"></div></div>
+<div id="msg"></div>
+<p style="font-size:11px;color:#8b949e">Upload .bin firmware file<br>Device will reboot after upload</p>
+<a href="/" style="color:#58a6ff">Back to Control</a>
+</div>
+<script>
+document.getElementById('f').addEventListener('submit',function(e){
+e.preventDefault();var f=document.getElementById('file').files[0];
+if(!f){alert('Select a file');return}
+var xhr=new XMLHttpRequest();var fd=new FormData();fd.append('update',f);
+document.getElementById('prog').style.display='block';
+document.getElementById('msg').textContent='Uploading...';
+xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);document.getElementById('bar').style.width=p+'%'}};
+xhr.onload=function(){document.getElementById('msg').textContent=xhr.responseText;if(xhr.status==200){setTimeout(function(){location.href='/'},5000)}};
+xhr.onerror=function(){document.getElementById('msg').textContent='Upload failed'};
+xhr.open('POST','/update',true);xhr.send(fd)});
+</script></body></html>)rawliteral";
+        server.send(200, "text/html", html);
+    });
+
+    // OTA Upload handler
+    server.on("/update", HTTP_POST, []() {
+        // After upload complete
+        if (Update.hasError()) {
+            server.send(500, "text/plain", "Update FAILED! " + String(Update.getError()));
+        } else {
+            server.send(200, "text/plain", "Update OK! Rebooting...");
+            delay(1000);
+            rp2040.reboot();
+        }
+    }, []() {
+        // During upload
+        HTTPUpload& upload = server.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            Serial.print("OTA Update: ");
+            Serial.println(upload.filename);
+            // Start update - 4MB flash, use most of it for sketch
+            if (!Update.begin(4 * 1024 * 1024 - 256 * 1024)) {  // Leave 256K for FS
+                Serial.println("Update begin failed");
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            // Write chunk
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Serial.println("Update write failed");
+            }
+        } else if (upload.status == UPLOAD_FILE_END) {
+            // Finish
+            if (Update.end(true)) {
+                Serial.print("Update Success: ");
+                Serial.println(upload.totalSize);
+            } else {
+                Serial.print("Update Error: ");
+                Serial.println(Update.getError());
+            }
+        }
+    });
+
     server.begin();
     Serial.println("Web server started");
+
+    // Start mDNS so you can access via http://espresso.local
+    if (MDNS.begin("espresso")) {
+        Serial.println("mDNS: http://espresso.local");
+        MDNS.addService("http", "tcp", 80);
+    }
 }

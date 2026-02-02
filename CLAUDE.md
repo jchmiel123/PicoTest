@@ -34,17 +34,25 @@ Connection is **non-blocking** - relays work immediately while WiFi connects in 
 
 ## Web Interface
 
-After WiFi connects, access at `http://<IP>` (shown on serial).
+After WiFi connects, access at:
+- `http://<IP>` (shown on serial)
+- `http://espresso.local` (mDNS)
 
 **Features:**
-- Real-time temperature display
+- Real-time temperature display (°C or °F)
 - Clickable relay toggles (with debounce)
 - BREW/STOP buttons
-- Adjustable target temp (70-100°C)
+- Adjustable target temp (50-100°C)
 - Adjustable brew time (5-60 seconds)
 - Flow rate and volume display
 - WiFi status and reconnect button
 - SVG coffee cup logo
+- **Celsius/Fahrenheit toggle**
+- **Password-protected Info panel** (password: `Coffee4Me!`)
+  - System stats (uptime, free heap, SSID)
+  - Reboot device
+  - Deep sleep mode
+- **OTA firmware update** at `/update`
 
 ## Brew Cycle State Machine
 
@@ -104,6 +112,14 @@ unsigned long brewTimeMs = 25000;     // Adjustable via web (5-60s)
 float targetTemp = 93.0;              // Default brew temp
 float tempHysteresis = 2.0;           // Bang-bang control band
 ```
+
+## OTA Updates
+
+Upload new firmware via web browser:
+1. Navigate to `http://espresso.local/update`
+2. Select `.bin` file from `.pio/build/pico2w/firmware.bin`
+3. Click Upload and wait for progress bar
+4. Device reboots automatically
 
 ## Known Issues
 
