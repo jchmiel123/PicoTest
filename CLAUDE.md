@@ -115,17 +115,37 @@ board_build.core = earlephilhower
 
 ## Coffee Machine Controller
 
-The current `main.cpp` implements a coffee machine controller with:
+The current `main.cpp` implements a coffee machine controller with WiFi web interface:
 
 **Features:**
-- 4 relays: pump, boiler heater, 3-way solenoid, main power
+- 4 relays: pump, boiler heater, 3-way solenoid, cup warmer
 - Flow sensor with pulse counting (ISR-based)
 - Thermistor temperature reading (Steinhart-Hart equation)
 - On/off heater control with hysteresis (bang-bang)
-- Brew cycle with temperature safety check
-- Serial command interface
+- Brew cycle state machine: IDLE → PREHEAT → BREW → FINISH
+- BOOTSEL button starts/stops brew (no external button needed!)
+- WiFi web interface for phone control
+- LED blink patterns for state indication
 
-**Commands (115200 baud):**
+**Brew Cycle:**
+1. Press BOOTSEL or web BREW button
+2. Preheat: Boiler heats to MIN_BREW_TEMP (85°C default)
+3. Brew: Pump + Solenoid ON together for brew time (25s default)
+4. Stop: All off, return to IDLE
+
+**Web Interface:**
+- Connect to WiFi, check serial for IP address
+- Open `http://<IP>` in browser
+- Features:
+  - Real-time temperature display
+  - Clickable relay toggles (pump, boiler, solenoid, warmer)
+  - BREW/STOP buttons
+  - Adjustable target temp (+/- 1°C)
+  - Adjustable brew time (+/- 5 seconds)
+  - Flow rate and volume display
+  - State indicator with countdown timer
+
+**Serial Commands (115200 baud):**
 | Key | Action |
 |-----|--------|
 | H | Help |
@@ -133,19 +153,29 @@ The current `main.cpp` implements a coffee machine controller with:
 | B | Start/Stop brew |
 | P | Toggle pump |
 | O | Toggle solenoid |
-| M | Toggle main power |
+| W | Toggle cup warmer |
 | +/- | Adjust target temp |
 | R | Reset flow counter |
 | X | EMERGENCY STOP |
 | 1-4 | Direct relay toggle |
 
 **Pinout:**
-- GP2-5: Relay outputs (active LOW)
+- GP2: Pump relay (active LOW)
+- GP3: Boiler heater relay
+- GP4: Solenoid relay
+- GP5: Cup warmer relay
 - GP6: Flow sensor (pulses)
-- GP26: Thermistor ADC
-- GP25: Onboard LED (heartbeat)
+- GP26: Thermistor ADC (ADC0)
+- LED_BUILTIN: Heartbeat (via CYW43 on Pico 2W)
+
+**Pico 2W Notes:**
+- Uses `board = rpipico2w` (not rpipico2)
+- LED is on WiFi chip (CYW43), not GPIO 25
+- GP23, GP24, GP25, GP29 reserved for WiFi - don't use!
+- Requires `#include <WiFi.h>` for LED and networking
 
 **Calibration needed:**
 - `PULSES_PER_ML` - adjust for your flow sensor
 - Thermistor coefficients if using different NTC
-- Heating rate estimate (currently ~2C/min)
+- `MIN_BREW_TEMP` - minimum temp to start brewing (default 85°C)
+- `brewTimeMs` - adjustable via web (default 25 seconds)
