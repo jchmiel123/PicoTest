@@ -32,6 +32,13 @@ Configured networks (tries in order):
 
 Connection is **non-blocking** - relays work immediately while WiFi connects in background.
 
+**Fallback AP Mode:** If WiFi fails after 3 retry cycles, creates hotspot:
+- SSID: `Espresso`
+- Password: `coffee123`
+- IP: `192.168.4.1`
+
+Serial command `C` retries WiFi from AP mode.
+
 ## Web Interface
 
 After WiFi connects, access at:
@@ -82,6 +89,7 @@ IDLE → PREHEATING → BREWING → FINISHING → IDLE
 | +/- | Adjust target temp |
 | R | Reset flow counter |
 | X | EMERGENCY STOP |
+| C | Retry WiFi connection |
 | 1-4 | Direct relay toggle |
 
 ## PlatformIO

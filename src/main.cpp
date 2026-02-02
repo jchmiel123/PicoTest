@@ -34,6 +34,11 @@ const WiFiNetwork WIFI_NETWORKS[] = {
 };
 const int NUM_NETWORKS = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 
+// Fallback AP mode settings
+const char* AP_SSID = "Espresso";
+const char* AP_PASS = "coffee123";  // Min 8 chars
+bool apMode = false;
+
 WebServer server(80);
 
 // ============ PIN DEFINITIONS ============
@@ -147,6 +152,8 @@ extern unsigned long wifiConnectStart;
 extern bool wifiConnecting;
 extern bool wifiSetupDone;
 extern int wifiRetryCount;
+extern unsigned int pollInterval;
+extern bool apMode;
 
 // ============ SETUP ============
 void setup() {
@@ -254,7 +261,8 @@ void loop() {
     // Run the brew state machine
     updateBrewCycle();
 
-    // Auto status print every 2 seconds if not idle
+    // Auto status print every 2 seconds if not idle, or every 30s if idle (with IP)
+    static unsigned long lastIdleStatus = 0;
     if (brewState != IDLE && (now - lastStatusPrint >= 2000)) {
         lastStatusPrint = now;
 
@@ -283,16 +291,38 @@ void loop() {
         Serial.println();
     }
 
+    // Print IP and status every 30 seconds when idle
+    if (brewState == IDLE && (now - lastIdleStatus >= 30000)) {
+        lastIdleStatus = now;
+        Serial.print("[IDLE] Temp: ");
+        Serial.print(boilerTemp, 1);
+        Serial.print("C | ");
+        if (apMode) {
+            Serial.print("AP: ");
+            Serial.print(AP_SSID);
+            Serial.print(" | http://");
+            Serial.println(WiFi.softAPIP());
+        } else if (WiFi.status() == WL_CONNECTED) {
+            Serial.print("http://");
+            Serial.print(WiFi.localIP());
+            Serial.print(" | espresso.local | ");
+            Serial.print(WiFi.RSSI());
+            Serial.println("dBm");
+        } else {
+            Serial.println("WiFi disconnected");
+        }
+    }
+
     // Serial commands
     if (Serial.available()) {
         char cmd = Serial.read();
         handleCommand(cmd);
     }
 
-    // Handle web requests (only if WiFi connected)
-    if (wifiSetupDone && WiFi.status() == WL_CONNECTED) {
+    // Handle web requests (WiFi STA or AP mode)
+    if (wifiSetupDone && (apMode || WiFi.status() == WL_CONNECTED)) {
         server.handleClient();
-        MDNS.update();
+        if (!apMode) MDNS.update();  // mDNS only works in STA mode
     }
 }
 
@@ -595,6 +625,17 @@ void handleCommand(char cmd) {
             Serial.println("!!! EMERGENCY STOP - ALL OFF !!!");
             break;
 
+        case 'c': case 'C':  // Retry WiFi connection
+            Serial.println("Retrying WiFi...");
+            apMode = false;
+            wifiSetupDone = false;
+            wifiConnecting = false;
+            wifiNetworkIndex = 0;
+            wifiRetryCount = 0;
+            WiFi.disconnect();
+            WiFi.mode(WIFI_STA);
+            break;
+
         case '1':  // Direct relay toggles (for testing/debug)
         case '2':
         case '3':
@@ -659,6 +700,7 @@ void printHelp() {
     Serial.println("  +/-   Adjust target temp");
     Serial.println("  R     Reset flow counter");
     Serial.println("  X     EMERGENCY STOP");
+    Serial.println("  C     Retry WiFi connection");
     Serial.println("  1-4   Direct relay toggle");
     Serial.println();
     Serial.println("BOOTSEL button also starts/stops brew");
@@ -676,13 +718,33 @@ bool wifiConnecting = false;
 bool wifiSetupDone = false;
 int wifiRetryCount = 0;
 
+void startAPMode() {
+    Serial.println("Starting AP mode...");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    apMode = true;
+    wifiSetupDone = true;
+
+    Serial.println("=================================");
+    Serial.print("AP Mode: ");
+    Serial.println(AP_SSID);
+    Serial.print("Password: ");
+    Serial.println(AP_PASS);
+    Serial.print("IP: ");
+    Serial.println(WiFi.softAPIP());
+    Serial.println("=================================");
+
+    setupWebServer();
+}
+
 void startWiFiConnect() {
     if (wifiNetworkIndex >= NUM_NETWORKS) {
         wifiNetworkIndex = 0;  // Loop back for retry
         wifiRetryCount++;
         if (wifiRetryCount > 2) {
-            Serial.println("WiFi gave up after retries - continuing without");
-            wifiSetupDone = true;
+            // Fall back to AP mode instead of giving up
+            Serial.println("WiFi failed - switching to AP mode");
+            startAPMode();
             return;
         }
     }
@@ -718,9 +780,14 @@ void updateWiFi() {
         return;
     }
 
-    // Timeout after 8 seconds per network
-    if (millis() - wifiConnectStart > 8000) {
-        Serial.println(" timeout");
+    // Timeout with exponential backoff: 5s, 8s, 12s per retry cycle
+    unsigned long timeout = 5000 + (wifiRetryCount * 3000);  // 5s, 8s, 11s...
+    if (timeout > 15000) timeout = 15000;  // Cap at 15s
+
+    if (millis() - wifiConnectStart > timeout) {
+        Serial.print(" timeout (");
+        Serial.print(timeout / 1000);
+        Serial.println("s)");
         WiFi.disconnect();
         wifiConnecting = false;
         wifiNetworkIndex++;
@@ -766,13 +833,17 @@ String getStatusJson() {
     json += "\"ssid\":\"" + WiFi.SSID() + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"uptime\":" + String(millis() / 1000) + ",";
-    json += "\"freeHeap\":" + String(rp2040.getFreeHeap());
+    json += "\"freeHeap\":" + String(rp2040.getFreeHeap()) + ",";
+    json += "\"pollInterval\":" + String(pollInterval);
     json += "}";
     return json;
 }
 
-String getWebPage() {
-    String html = R"rawliteral(<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="UTF-8"><title>Espresso</title><style>
+// Poll interval in ms - adjustable via web
+unsigned int pollInterval = 2000;  // Default 2 seconds
+
+// HTML stored in PROGMEM (flash) - saves RAM
+const char MAIN_PAGE[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="UTF-8"><title>Espresso</title><style>
 *{box-sizing:border-box}body{font-family:Arial;background:#0d1117;color:#c9d1d9;margin:0;padding:10px}
 .h{display:flex;align-items:center;gap:10px;margin-bottom:10px}.logo{width:40px;height:40px}h1{margin:0;font-size:20px;color:#58a6ff}
 .c{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px;margin:8px 0}
@@ -826,6 +897,7 @@ String getWebPage() {
 <div><span class="fl">Signal:</span><br><span class="fv" id="irssi">--</span>dBm</div>
 <div><span class="fl">IP Address:</span><br><span class="fv" id="iip">--</span></div>
 <div><span class="fl">Temp Unit:</span><br><span class="fv" id="iunit">C</span></div>
+<div><span class="fl">Poll (ms):</span><br><span class="fv" id="ipoll">2000</span></div>
 </div></div>
 <div class="c"><div class="sl">System Controls</div>
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
@@ -835,6 +907,8 @@ String getWebPage() {
 <button class="bn" style="background:#238636;color:#fff" onclick="toggleUnit()">Toggle C/F</button>
 <button class="bn" style="background:#30363d;color:#c9d1d9" onclick="sysCmd('defaults')">Reset Defaults</button>
 <button class="bn" style="background:#30363d;color:#c9d1d9" onclick="sysCmd('wifireset')">WiFi Reconnect</button>
+<button class="bn" style="background:#21262d;color:#8b949e" onclick="adjPoll(-500)">Poll -</button>
+<button class="bn" style="background:#21262d;color:#8b949e" onclick="adjPoll(500)">Poll +</button>
 <button class="bn" style="background:#f78166;color:#000;grid-column:span 2" onclick="location.href='/update'">OTA Firmware Update</button>
 </div></div>
 <div class="c"><div class="sl">GPIO Pins</div>
@@ -869,6 +943,7 @@ document.getElementById('issid').textContent=d.ssid;
 document.getElementById('irssi').textContent=d.rssi;
 document.getElementById('iip').textContent=d.ip;
 document.getElementById('iunit').textContent=u;
+document.getElementById('ipoll').textContent=d.pollInterval;
 }).catch(e=>{})}
 function formatUptime(s){var h=Math.floor(s/3600);var m=Math.floor((s%3600)/60);var sec=s%60;return h+'h '+m+'m '+sec+'s'}
 var L=0;function T(r){if(L)return;L=1;fetch('/toggle?r='+r).then(x=>x.json()).then(d=>{L=0;['pump','boiler','solenoid','warmer'].forEach(r=>{document.getElementById(r).className='rb '+(d[r]?'on':'off')})}).catch(e=>{L=0})}
@@ -878,8 +953,14 @@ function showInfo(){document.getElementById('infopanel').style.display='block';d
 function hideInfo(){document.getElementById('infopanel').style.display='none'}
 function checkPw(){fetch('/checkpw?pw='+encodeURIComponent(document.getElementById('infopw').value)).then(r=>r.text()).then(x=>{if(x==='OK'){document.getElementById('infolock').style.display='none';document.getElementById('infocontent').style.display='block'}else{alert('Wrong password')}})}
 function sysCmd(c){if(c==='reboot'&&!confirm('Reboot the Pico?'))return;if(c==='sleep'&&!confirm('Enter deep sleep? Power cycle to wake.'))return;if(c==='defaults'&&!confirm('Reset settings to defaults?'))return;fetch('/sys?cmd='+c).then(r=>r.text()).then(x=>{alert(x);if(c==='reboot'||c==='sleep')hideInfo()})}
-setInterval(U,1000);U()
+function adjPoll(d){fetch('/poll?delta='+d).then(r=>r.text()).then(x=>{document.getElementById('ipoll').textContent=x})}
+var PI=2000;setInterval(U,PI);U()
 </script></body></html>)rawliteral";
+
+String getWebPage() {
+    // Read from PROGMEM and inject current poll interval
+    String html = FPSTR(MAIN_PAGE);
+    html.replace("var PI=2000", "var PI=" + String(pollInterval));
     return html;
 }
 
@@ -967,6 +1048,18 @@ void setupWebServer() {
         flowPulseCount = 0;
         Serial.println("Flow counter reset");
         server.send(200, "text/plain", "OK");
+    });
+
+    // Poll interval adjustment
+    server.on("/poll", []() {
+        int delta = server.arg("delta").toInt();
+        pollInterval += delta;
+        if (pollInterval < 500) pollInterval = 500;    // Min 0.5s
+        if (pollInterval > 10000) pollInterval = 10000; // Max 10s
+        Serial.print("Poll interval: ");
+        Serial.print(pollInterval);
+        Serial.println(" ms");
+        server.send(200, "text/plain", String(pollInterval));
     });
 
     // WiFi reconnect
@@ -1084,7 +1177,9 @@ xhr.open('POST','/update',true);xhr.send(fd)});
             Serial.print("OTA Update: ");
             Serial.println(upload.filename);
             // Start update - 4MB flash, use most of it for sketch
-            if (!Update.begin(4 * 1024 * 1024 - 256 * 1024)) {  // Leave 256K for FS
+            // Use file size from content-length header
+            size_t updateSize = server.clientContentLength();
+            if (!Update.begin(updateSize)) {
                 Serial.println("Update begin failed");
             }
         } else if (upload.status == UPLOAD_FILE_WRITE) {
