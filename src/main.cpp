@@ -19,7 +19,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LEAmDNS.h>
-#include <Updater.h>
+// OTA removed - Updater.h doesn't work on RP2350 (Error 4). See ForgeRepo/CAPABILITIES.md
 
 // ============ WIFI CONFIG ============
 // Multiple networks - will try each in order
@@ -909,7 +909,6 @@ const char MAIN_PAGE[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><meta n
 <button class="bn" style="background:#30363d;color:#c9d1d9" onclick="sysCmd('wifireset')">WiFi Reconnect</button>
 <button class="bn" style="background:#21262d;color:#8b949e" onclick="adjPoll(-500)">Poll -</button>
 <button class="bn" style="background:#21262d;color:#8b949e" onclick="adjPoll(500)">Poll +</button>
-<button class="bn" style="background:#f78166;color:#000;grid-column:span 2" onclick="location.href='/update'">OTA Firmware Update</button>
 </div></div>
 <div class="c"><div class="sl">GPIO Pins</div>
 <div style="font-size:11px;color:#8b949e;margin-top:8px">
@@ -1123,81 +1122,8 @@ void setupWebServer() {
         }
     });
 
-    // OTA Update page
-    server.on("/update", HTTP_GET, []() {
-        String html = R"rawliteral(<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font-family:Arial;background:#0d1117;color:#c9d1d9;padding:20px;text-align:center}
-.c{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;max-width:400px;margin:auto}
-h2{color:#58a6ff}input[type=file]{margin:20px 0}
-.btn{background:#238636;color:#fff;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:16px}
-.prog{width:100%;height:20px;background:#21262d;border-radius:10px;overflow:hidden;margin:20px 0;display:none}
-.bar{width:0%;height:100%;background:#238636;transition:width 0.3s}
-#msg{margin-top:20px;color:#8b949e}
-</style></head><body>
-<div class="c"><h2>OTA Firmware Update</h2>
-<form method="POST" action="/update" enctype="multipart/form-data" id="f">
-<input type="file" name="update" accept=".bin,.uf2" id="file">
-<br><button type="submit" class="btn">Upload</button>
-</form>
-<div class="prog" id="prog"><div class="bar" id="bar"></div></div>
-<div id="msg"></div>
-<p style="font-size:11px;color:#8b949e">Upload .bin firmware file<br>Device will reboot after upload</p>
-<a href="/" style="color:#58a6ff">Back to Control</a>
-</div>
-<script>
-document.getElementById('f').addEventListener('submit',function(e){
-e.preventDefault();var f=document.getElementById('file').files[0];
-if(!f){alert('Select a file');return}
-var xhr=new XMLHttpRequest();var fd=new FormData();fd.append('update',f);
-document.getElementById('prog').style.display='block';
-document.getElementById('msg').textContent='Uploading...';
-xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);document.getElementById('bar').style.width=p+'%'}};
-xhr.onload=function(){document.getElementById('msg').textContent=xhr.responseText;if(xhr.status==200){setTimeout(function(){location.href='/'},5000)}};
-xhr.onerror=function(){document.getElementById('msg').textContent='Upload failed'};
-xhr.open('POST','/update',true);xhr.send(fd)});
-</script></body></html>)rawliteral";
-        server.send(200, "text/html", html);
-    });
-
-    // OTA Upload handler
-    server.on("/update", HTTP_POST, []() {
-        // After upload complete
-        if (Update.hasError()) {
-            server.send(500, "text/plain", "Update FAILED! " + String(Update.getError()));
-        } else {
-            server.send(200, "text/plain", "Update OK! Rebooting...");
-            delay(1000);
-            rp2040.reboot();
-        }
-    }, []() {
-        // During upload
-        HTTPUpload& upload = server.upload();
-        if (upload.status == UPLOAD_FILE_START) {
-            Serial.print("OTA Update: ");
-            Serial.println(upload.filename);
-            // Start update - 4MB flash, use most of it for sketch
-            // Use file size from content-length header
-            size_t updateSize = server.clientContentLength();
-            if (!Update.begin(updateSize)) {
-                Serial.println("Update begin failed");
-            }
-        } else if (upload.status == UPLOAD_FILE_WRITE) {
-            // Write chunk
-            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-                Serial.println("Update write failed");
-            }
-        } else if (upload.status == UPLOAD_FILE_END) {
-            // Finish
-            if (Update.end(true)) {
-                Serial.print("Update Success: ");
-                Serial.println(upload.totalSize);
-            } else {
-                Serial.print("Update Error: ");
-                Serial.println(Update.getError());
-            }
-        }
-    });
+    // OTA removed - Updater.h doesn't work on RP2350 (Error 4)
+    // Code preserved in ForgeRepo/CAPABILITIES.md for when SDK improves
 
     server.begin();
     Serial.println("Web server started");

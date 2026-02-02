@@ -59,7 +59,7 @@ After WiFi connects, access at:
   - System stats (uptime, free heap, SSID)
   - Reboot device
   - Deep sleep mode
-- **OTA firmware update** at `/update`
+- ~~OTA firmware update~~ (broken on RP2350, use USB)
 
 ## Brew Cycle State Machine
 
@@ -121,15 +121,9 @@ float targetTemp = 93.0;              // Default brew temp
 float tempHysteresis = 2.0;           // Bang-bang control band
 ```
 
-## OTA Updates
-
-Upload new firmware via web browser:
-1. Navigate to `http://espresso.local/update`
-2. Select `.bin` file from `.pio/build/pico2w/firmware.bin`
-3. Click Upload and wait for progress bar
-4. Device reboots automatically
-
 ## Known Issues
+
+- **OTA not working** - RP2350 Updater library broken (Error 4). Use USB/BOOTSEL upload.
 
 - GP3 (boiler) may need different pin if relay module is faulty
 - WiFi can take 8-15 seconds to connect on first boot
